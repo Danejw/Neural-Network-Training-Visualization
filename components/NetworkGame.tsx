@@ -833,9 +833,44 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
       {/* Visualization Canvas */}
       <div className="flex-1 bg-slate-950 rounded-xl border border-white/10 relative shadow-inner overflow-hidden">
          {isOptimized && (
-             <div className="absolute top-10 left-1/2 -translate-x-1/2 z-20 bg-black/80 backdrop-blur border border-neon-green px-6 py-3 rounded-full flex items-center gap-3 animate-bounce">
-                 <CheckCircle className="text-neon-green" /> <span className="text-neon-green font-bold font-mono">OPTIMIZED</span>
-             </div>
+            <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                <div className="bg-panel-bg border border-neon-green/50 rounded-2xl p-8 shadow-[0_0_50px_rgba(0,255,0,0.2)] max-w-md w-full flex flex-col items-center gap-6 animate-in fade-in zoom-in duration-300">
+                    <div className="w-16 h-16 rounded-full bg-neon-green/20 flex items-center justify-center border border-neon-green text-neon-green shadow-[0_0_20px_rgba(0,255,0,0.4)]">
+                        <CheckCircle size={32} />
+                    </div>
+                    
+                    <div className="text-center">
+                        <h2 className="text-2xl font-bold text-white font-mono tracking-wider">OPTIMIZATION COMPLETE</h2>
+                        <p className="text-slate-400 text-sm mt-2">Target loss threshold reached.</p>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4 w-full">
+                        <div className="bg-slate-900/50 p-4 rounded-xl border border-white/5 text-center">
+                            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1">Epochs</div>
+                            <div className="text-2xl font-mono font-bold text-white">{epochs}</div>
+                        </div>
+                        <div className="bg-slate-900/50 p-4 rounded-xl border border-white/5 text-center">
+                            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1">Final Loss</div>
+                            <div className="text-2xl font-mono font-bold text-neon-green">{displayStats.loss.toFixed(6)}</div>
+                        </div>
+                        <div className="bg-slate-900/50 p-4 rounded-xl border border-white/5 text-center">
+                            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1">Learning Rate</div>
+                            <div className="text-xl font-mono font-bold text-white">{learningRate}</div>
+                        </div>
+                        <div className="bg-slate-900/50 p-4 rounded-xl border border-white/5 text-center">
+                            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-1">Structure</div>
+                            <div className="text-xs font-mono text-slate-300 mt-1">{layerDims.map(d => `${d.rows}x${d.cols}`).join(' - ')}</div>
+                        </div>
+                    </div>
+
+                    <button 
+                        onClick={() => setIsOptimized(false)}
+                        className="w-full py-3 bg-neon-green text-black font-bold rounded-xl hover:bg-white transition-colors flex items-center justify-center gap-2"
+                    >
+                        CONTINUE TRAINING
+                    </button>
+                </div>
+            </div>
          )}
          <svg 
             ref={svgRef}
