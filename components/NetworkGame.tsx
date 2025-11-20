@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Network, Play, Pause, RotateCcw, Plus, Minus, Activity, CheckCircle, ZoomIn, ZoomOut, Move, Sliders, Eye } from 'lucide-react';
+import { Network, Play, Pause, RotateCcw, Plus, Minus, Activity, CheckCircle, ZoomIn, ZoomOut, Move, Sliders, Eye, GripHorizontal, BoxSelect } from 'lucide-react';
 import { LineChart, Line, ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { TutorContext, GameMode } from '../types';
 
@@ -60,7 +60,11 @@ class SimpleNetwork {
         }
         this.weights.push(layerWeights);
         this.weightDeltas.push(layerDeltas);
-        this.biases.push(new Array(currSize).fill(0.1));
+        
+        // Biases for current layer
+        // Initialize to small positive value to prevent "Dead ReLU" at start
+        // Randomize slightly to ensure visual distinctness on reset (0.01 to 0.21)
+        this.biases.push(new Array(currSize).fill(0).map(() => 0.01 + Math.random() * 0.2));
       }
     }
   }
@@ -169,17 +173,26 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
   const [isOptimized, setIsOptimized] = useState(false);
   const [lossHistory, setLossHistory] = useState<{epoch: number, loss: number}[]>([]);
   
+  // UI Panel Positions
+  const [lossGraphPos, setLossGraphPos] = useState({ x: 24, y: 80 });
+  const [viewSettingsPos, setViewSettingsPos] = useState({ x: 24, y: 230 });
+  
   // 3D Viewport State
-  const [rotation, setRotation] = useState(25); // Degrees
+  const [cameraAngle, setCameraAngle] = useState({ h: 25, v: 15 }); // Horizontal (Yaw), Vertical (Pitch)
   const [viewScale, setViewScale] = useState(1);
   const [viewOffset, setViewOffset] = useState({ x: 0, y: 0 });
+  const [isOrtho, setIsOrtho] = useState(false); // Orthographic vs Perspective
+  
   const [viewSettings, setViewSettings] = useState({
       nodeSize: 12,
       textSize: 10,
-      animWidth: 4
+      animWidth: 4,
+      sliderSize: 1.0
   });
 
-  const isDraggingRef = useRef(false);
+  // Interaction Refs
+  const isDraggingCanvasRef = useRef(false);
+  const draggingUIRef = useRef<{ id: 'LOSS' | 'SETTINGS', offsetX: number, offsetY: number } | null>(null);
   const lastMouseRef = useRef({ x: 0, y: 0 });
   const svgRef = useRef<SVGSVGElement>(null);
   
@@ -194,10 +207,11 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
       weights: [] as number[][][],
       deltas: [] as number[][][],
       biases: [] as number[][],
+      preActivations: [] as number[][],
       loss: 0
   });
 
-  // Initialize/Reset Network
+  // Initialize Network (Structure Change)
   useEffect(() => {
       const layerSizes = layerDims.map(d => d.rows * d.cols);
       const net = new SimpleNetwork(layerSizes, layerActivations);
@@ -210,12 +224,8 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
       if (target.length !== outputSize) setTarget(new Array(outputSize).fill(0));
       
       networkRef.current = net;
-      resetState();
-      updateVisuals();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(layerDims)]);
-
-  const resetState = () => {
+      
+      // Reset Counters manually
       setEpochs(0);
       epochRef.current = 0;
       setLossHistory([]);
@@ -223,6 +233,29 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
       setIsOptimized(false);
       setDirection('NONE');
       setActiveLayer(-1);
+
+      updateVisuals();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(layerDims)]);
+
+  // Hard Reset (Randomize Weights)
+  const resetSimulation = () => {
+      const layerSizes = layerDims.map(d => d.rows * d.cols);
+      // Create NEW network -> Randomizes weights and biases
+      const net = new SimpleNetwork(layerSizes, layerActivations);
+      networkRef.current = net;
+
+      setEpochs(0);
+      epochRef.current = 0;
+      setLossHistory([]);
+      setIsPlaying(false);
+      setIsOptimized(false);
+      setDirection('NONE');
+      setActiveLayer(-1);
+      
+      // Initial Forward
+      net.forward(inputs);
+      updateVisuals();
   };
 
   const updateVisuals = () => {
@@ -237,6 +270,7 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
           weights: JSON.parse(JSON.stringify(net.weights)),
           deltas: JSON.parse(JSON.stringify(net.weightDeltas)),
           biases: JSON.parse(JSON.stringify(net.biases)),
+          preActivations: JSON.parse(JSON.stringify(net.preActivations)),
           loss: totalLoss
       });
       return totalLoss;
@@ -269,7 +303,7 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
   // Simulation Loop
   useEffect(() => {
     let animationFrame: number;
-    let timer: NodeJS.Timeout;
+    let timer: ReturnType<typeof setTimeout>;
     const CONVERGENCE = 0.00005;
 
     if (isPlaying && networkRef.current) {
@@ -336,27 +370,132 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
       const y3d = yStart + (row * rowSpacing);
       const z3d = zStart + (col * colSpacing);
 
-      // Rotation
-      const rad = (rotation * Math.PI) / 180;
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
+      // Rotation Math
+      const radH = (cameraAngle.h * Math.PI) / 180;
+      const radV = (cameraAngle.v * Math.PI) / 180;
       
-      const xRot = x3d * cos - z3d * sin;
-      const zRot = x3d * sin + z3d * cos;
+      const cosH = Math.cos(radH);
+      const sinH = Math.sin(radH);
+      const cosV = Math.cos(radV);
+      const sinV = Math.sin(radV);
+      
+      // 1. Rotate around Y (Horizontal)
+      const x1 = x3d * cosH - z3d * sinH;
+      const y1 = y3d;
+      const z1 = x3d * sinH + z3d * cosH;
 
-      // Perspective
+      // 2. Rotate around X (Vertical)
+      const x2 = x1;
+      const y2 = y1 * cosV - z1 * sinV;
+      const z2 = y1 * sinV + z1 * cosV;
+
+      // Perspective vs Orthographic
       const fov = 1000;
-      const baseScale = fov / (fov - zRot); // Z gets smaller as it goes back
-      
-      // Apply Global Zoom (viewScale) to the perspective
+      const baseScale = isOrtho ? 1.0 : (fov / (fov - z2)); 
       const finalScale = baseScale * viewScale;
 
+      // Apply viewScale to coordinates for zoom translation effect
       return {
-          x: 400 + (xRot * finalScale) + viewOffset.x, // Apply zoom to position spread
-          y: 300 + (y3d * finalScale) + viewOffset.y, // Apply zoom to position spread
-          scale: finalScale, // Used for element sizing
-          depth: zRot
+          x: 400 + (x2 * viewScale * (isOrtho ? 1 : baseScale)) + viewOffset.x, 
+          y: 300 + (y2 * viewScale * (isOrtho ? 1 : baseScale)) + viewOffset.y, 
+          scale: finalScale,
+          depth: z2
       };
+  };
+
+  // --- Helpers ---
+  const getActivationVisual = (key: ActivationKey, avgInput: number, width: number, height: number) => {
+    if (!isFinite(avgInput)) avgInput = 0;
+    const func = ACTIVATION_FUNCTIONS[key].func;
+    const points = [];
+    const range = 3; 
+    const step = 0.3;
+    const normX = (x: number) => (x + range) / (range * 2) * width;
+    const normY = (y: number) => {
+        let yNorm = y;
+        if (key === 'SIGMOID') yNorm = y; 
+        else if (key === 'TANH') yNorm = (y + 1) / 2; 
+        else yNorm = (y + 1) / 3; 
+        return height - (Math.max(0, Math.min(1, yNorm)) * height);
+    };
+    for (let x = -range; x <= range; x += step) {
+        const y = func(x);
+        points.push(`${normX(x).toFixed(1)},${normY(y).toFixed(1)}`);
+    }
+    const pathD = `M ${points.join(' L ')}`;
+    const dotX = normX(Math.max(-range, Math.min(range, avgInput)));
+    const dotY = normY(func(avgInput));
+    return { pathD, dotX, dotY };
+  };
+
+  const cycleActivation = (layerIdx: number) => {
+      const current = layerActivations[layerIdx];
+      const currentIndex = ACTIVATION_KEYS.indexOf(current);
+      const nextIndex = (currentIndex + 1) % ACTIVATION_KEYS.length;
+      const nextKey = ACTIVATION_KEYS[nextIndex];
+      
+      const newActivations = [...layerActivations];
+      newActivations[layerIdx] = nextKey;
+      setLayerActivations(newActivations);
+      setIsOptimized(false);
+  };
+
+  // --- Axis Gizmo Helpers ---
+  const renderAxisGizmo = () => {
+      const radH = (cameraAngle.h * Math.PI) / 180;
+      const radV = (cameraAngle.v * Math.PI) / 180;
+      const cosH = Math.cos(radH);
+      const sinH = Math.sin(radH);
+      const cosV = Math.cos(radV);
+      const sinV = Math.sin(radV);
+
+      const projectAxis = (x: number, y: number, z: number) => {
+          const x1 = x * cosH - z * sinH;
+          const y1 = y;
+          const z1 = x * sinH + z * cosH;
+
+          const x2 = x1;
+          const y2 = y1 * cosV - z1 * sinV;
+          const z2 = y1 * sinV + z1 * cosV;
+
+          return { x: 50 + x2 * 35, y: 50 + y2 * 35, z: z2 }; // Center at 50,50 in gizmo svg
+      };
+
+      const origin = projectAxis(0, 0, 0);
+      const xAxis = projectAxis(1, 0, 0); // Layer Axis (Red)
+      const yAxis = projectAxis(0, 1, 0); // Row Axis (Green)
+      const zAxis = projectAxis(0, 0, 1); // Col Axis (Blue)
+
+      const handleAxisClick = (e: React.MouseEvent, view: {h: number, v: number}) => {
+          e.stopPropagation();
+          const isSameView = Math.abs(cameraAngle.h - view.h) < 0.1 && Math.abs(cameraAngle.v - view.v) < 0.1;
+          
+          if (isSameView) {
+              setIsOrtho(!isOrtho);
+          } else {
+              setCameraAngle(view);
+              setIsOrtho(false);
+          }
+      };
+
+      const items = [
+          { id: 'x', color: '#ff4444', end: xAxis, label: 'X', view: { h: 90, v: 0 } },
+          { id: 'y', color: '#44ff44', end: yAxis, label: 'Y', view: { h: 0, v: 90 } },
+          { id: 'z', color: '#4444ff', end: zAxis, label: 'Z', view: { h: 0, v: 0 } }
+      ].sort((a, b) => a.end.z - b.end.z); // Sort by depth so front axes are on top
+
+      return (
+          <svg width="100" height="100" className="overflow-visible select-none">
+              {items.map(item => (
+                  <g key={item.id} className="cursor-pointer hover:brightness-125" onClick={(e) => handleAxisClick(e, item.view)}>
+                      <line x1={origin.x} y1={origin.y} x2={item.end.x} y2={item.end.y} stroke={item.color} strokeWidth="2" />
+                      <circle cx={item.end.x} cy={item.end.y} r="6" fill={item.color} />
+                      <text x={item.end.x} y={item.end.y + 3} textAnchor="middle" fill="black" fontSize="8" fontWeight="bold">{item.label}</text>
+                  </g>
+              ))}
+              <circle cx={origin.x} cy={origin.y} r="4" fill={isOrtho ? "#00f3ff" : "white"} className="cursor-pointer hover:fill-slate-300" onClick={(e) => { e.stopPropagation(); setCameraAngle({h: 25, v: 15}); setIsOrtho(false); }}/>
+          </svg>
+      );
   };
 
   // --- Render List Generation ---
@@ -391,6 +530,17 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
                           lIdx,
                           pos: { ...pos, y: pos.y + 60 * pos.scale },
                           depth: pos.depth + 10 // Draw in front
+                      });
+                  }
+
+                  // Activation Control (Attached to TOP of layer column) - Only for Hidden Layers
+                  if (!isInput && !isOutput && r === 0 && c === Math.floor(dim.cols/2)) {
+                       items.push({
+                          type: 'ACTIVATION_CONTROL',
+                          key: `act-${lIdx}`,
+                          lIdx,
+                          pos: { ...pos, y: pos.y - 90 * pos.scale }, // Position above
+                          depth: pos.depth + 10 
                       });
                   }
               }
@@ -435,7 +585,7 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
       return items.sort((a, b) => a.depth - b.depth);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layerDims, rotation, viewScale, viewOffset, displayStats, direction, activeLayer, inputs, target, viewSettings]);
+  }, [layerDims, cameraAngle, viewScale, viewOffset, displayStats, direction, activeLayer, inputs, target, viewSettings, isOrtho]);
 
   // UI Handlers
   const modifyLayer = (lIdx: number, dKey: 'rows' | 'cols', delta: number) => {
@@ -469,20 +619,50 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
   };
 
   // Mouse Controls
-  const handleMouseDown = (e: React.MouseEvent) => { 
-      isDraggingRef.current = true; 
+  const handleStartUIDrag = (e: React.MouseEvent, id: 'LOSS' | 'SETTINGS') => {
+      e.stopPropagation();
+      const rect = e.currentTarget.getBoundingClientRect();
+      draggingUIRef.current = {
+          id,
+          offsetX: e.clientX - rect.left,
+          offsetY: e.clientY - rect.top
+      };
+  };
+
+  const handleMouseDownCanvas = (e: React.MouseEvent) => { 
+      isDraggingCanvasRef.current = true; 
       lastMouseRef.current = { x: e.clientX, y: e.clientY }; 
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-      if (!isDraggingRef.current) return;
+      // Handle UI Dragging
+      if (draggingUIRef.current) {
+          const { id, offsetX, offsetY } = draggingUIRef.current;
+          const newX = e.clientX - offsetX;
+          const newY = e.clientY - offsetY;
+          
+          if (id === 'LOSS') {
+              setLossGraphPos({ x: Math.max(0, newX), y: Math.max(0, newY) });
+          } else {
+              setViewSettingsPos({ x: Math.max(0, newX), y: Math.max(0, newY) });
+          }
+          return;
+      }
+
+      // Handle Canvas Dragging/Orbit
+      if (!isDraggingCanvasRef.current) return;
       
       const dx = e.clientX - lastMouseRef.current.x;
       const dy = e.clientY - lastMouseRef.current.y;
       
       if (e.buttons === 1) {
-          // Left Click: Rotate
-          setRotation(r => r + dx * 0.5);
+          // Left Click: Orbit (Yaw and Pitch)
+          // Disables Ortho mode when manually rotating
+          setIsOrtho(false);
+          setCameraAngle(prev => ({
+              h: prev.h + dx * 0.5,
+              v: Math.max(-90, Math.min(90, prev.v + dy * 0.5))
+          }));
       } else if (e.buttons === 2 || e.buttons === 3) {
           // Right Click or Both: Pan
           setViewOffset(prev => ({
@@ -493,11 +673,14 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
       
       lastMouseRef.current = { x: e.clientX, y: e.clientY };
   };
-  const handleMouseUp = () => { isDraggingRef.current = false; };
+  const handleMouseUp = () => { 
+      isDraggingCanvasRef.current = false; 
+      draggingUIRef.current = null;
+  };
   const handleWheel = (e: React.WheelEvent) => { setViewScale(s => Math.max(0.05, Math.min(5, s - e.deltaY * 0.001))); };
 
   return (
-    <div className="h-full flex flex-col p-6 relative select-none">
+    <div className="h-full flex flex-col p-6 relative select-none" onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}>
       <div className="absolute inset-0 bg-gradient-to-tr from-slate-900 via-blue-900/10 to-black -z-10" />
       
       <style>{`
@@ -520,32 +703,45 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
          </div>
       </div>
 
-      {/* Loss Graph */}
-      <div className="absolute top-6 left-6 z-20 w-64 h-32 bg-panel-bg/80 backdrop-blur border border-white/10 rounded-xl p-2 shadow-xl">
-         <div className="flex justify-between items-center px-2 mb-1">
-            <span className="text-[10px] font-bold text-slate-400">LOSS</span>
+      {/* Loss Graph (Draggable) */}
+      <div 
+        style={{ left: lossGraphPos.x, top: lossGraphPos.y }}
+        onMouseDown={(e) => handleStartUIDrag(e, 'LOSS')}
+        className="absolute z-20 w-64 h-32 bg-panel-bg/80 backdrop-blur border border-white/10 rounded-xl p-2 shadow-xl cursor-auto"
+      >
+         <div className="flex justify-between items-center px-2 mb-1 cursor-move" title="Drag to move">
+            <div className="flex items-center gap-2">
+                <GripHorizontal size={14} className="text-slate-500"/>
+                <span className="text-[10px] font-bold text-slate-400">LOSS</span>
+            </div>
             <span className={`text-[10px] font-mono font-bold ${displayStats.loss < 0.01 ? 'text-green-400' : 'text-red-400'}`}>{displayStats.loss.toFixed(6)}</span>
          </div>
-         <ResponsiveContainer width="100%" height="80%">
-            <AreaChart data={lossHistory}>
-                 <defs>
-                    <linearGradient id="colorLoss" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#00f3ff" stopOpacity={0.3}/>
-                    <stop offset="95%" stopColor="#00f3ff" stopOpacity={0}/>
-                    </linearGradient>
-                </defs>
-                <Area type="monotone" dataKey="loss" stroke="#00f3ff" strokeWidth={2} fill="url(#colorLoss)" isAnimationActive={false} />
-            </AreaChart>
-         </ResponsiveContainer>
+         <div onMouseDown={e => e.stopPropagation()} className="h-[80%]">
+             <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={lossHistory}>
+                     <defs>
+                        <linearGradient id="colorLoss" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#00f3ff" stopOpacity={0.3}/>
+                        <stop offset="95%" stopColor="#00f3ff" stopOpacity={0}/>
+                        </linearGradient>
+                    </defs>
+                    <Area type="monotone" dataKey="loss" stroke="#00f3ff" strokeWidth={2} fill="url(#colorLoss)" isAnimationActive={false} />
+                </AreaChart>
+             </ResponsiveContainer>
+         </div>
       </div>
 
-      {/* VIEW SETTINGS PANEL (Top Right) */}
-      <div className="absolute top-20 right-6 z-30 bg-panel-bg/80 backdrop-blur border border-white/10 rounded-xl p-4 shadow-xl w-48 flex flex-col gap-4" onMouseDown={(e) => e.stopPropagation()}>
-          <div className="flex items-center gap-2 text-slate-400 text-xs font-bold border-b border-white/10 pb-2">
-              <Eye size={14} /> VIEW SETTINGS
+      {/* VIEW SETTINGS PANEL (Draggable, Default Left) */}
+      <div 
+          style={{ left: viewSettingsPos.x, top: viewSettingsPos.y }}
+          onMouseDown={(e) => handleStartUIDrag(e, 'SETTINGS')}
+          className="absolute z-30 bg-panel-bg/80 backdrop-blur border border-white/10 rounded-xl p-4 shadow-xl w-48 flex flex-col gap-4"
+      >
+          <div className="flex items-center gap-2 text-slate-400 text-xs font-bold border-b border-white/10 pb-2 cursor-move">
+              <GripHorizontal size={14} /> <Eye size={14} /> VIEW SETTINGS
           </div>
           
-          <div>
+          <div onMouseDown={e => e.stopPropagation()}>
               <div className="flex justify-between text-[10px] text-slate-500 mb-1">NODE SIZE</div>
               <input 
                   type="range" min="5" max="30" step="1" 
@@ -555,7 +751,7 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
               />
           </div>
 
-          <div>
+          <div onMouseDown={e => e.stopPropagation()}>
               <div className="flex justify-between text-[10px] text-slate-500 mb-1">TEXT SIZE</div>
               <input 
                   type="range" min="0" max="20" step="1" 
@@ -565,7 +761,7 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
               />
           </div>
 
-          <div>
+          <div onMouseDown={e => e.stopPropagation()}>
               <div className="flex justify-between text-[10px] text-slate-500 mb-1">ANIM WIDTH</div>
               <input 
                   type="range" min="1" max="15" step="1" 
@@ -574,6 +770,31 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
                   className="w-full accent-green-500 h-1 bg-slate-700 rounded"
               />
           </div>
+          
+          <div onMouseDown={e => e.stopPropagation()}>
+              <div className="flex justify-between text-[10px] text-slate-500 mb-1">SLIDER SIZE</div>
+              <input 
+                  type="range" min="0" max="2.0" step="0.1" 
+                  value={viewSettings.sliderSize} 
+                  onChange={(e) => setViewSettings(s => ({...s, sliderSize: Number(e.target.value)}))}
+                  className="w-full accent-pink-500 h-1 bg-slate-700 rounded"
+              />
+          </div>
+          
+           <div onMouseDown={e => e.stopPropagation()}>
+              <div className="flex justify-between text-[10px] text-slate-500 mb-1">PROJECTION</div>
+              <button 
+                onClick={() => setIsOrtho(!isOrtho)}
+                className={`w-full py-1 text-[10px] font-bold rounded border ${isOrtho ? 'bg-neon-blue/20 border-neon-blue text-neon-blue' : 'bg-slate-800 border-white/10 text-slate-400'}`}
+              >
+                  {isOrtho ? '2D ORTHOGRAPHIC' : '3D PERSPECTIVE'}
+              </button>
+          </div>
+      </div>
+      
+      {/* 3D AXIS GIZMO (Unity Style) */}
+      <div className="absolute top-4 right-6 z-30 bg-black/40 rounded-full p-1 border border-white/10 backdrop-blur">
+          {renderAxisGizmo()}
       </div>
 
       {/* Bottom Controls */}
@@ -581,14 +802,31 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
          <button onClick={() => setIsPlaying(!isPlaying)} className={`w-12 h-12 rounded-xl flex items-center justify-center ${isPlaying ? 'bg-red-500 text-white' : 'bg-blue-500 text-white'}`}>
             {isPlaying ? <Pause size={24} fill="currentColor"/> : <Play size={24} fill="currentColor"/>}
          </button>
-         <button onClick={resetState} className="w-12 h-12 bg-slate-800 text-slate-400 hover:text-white rounded-xl flex items-center justify-center"><RotateCcw size={20}/></button>
+         <button onClick={resetSimulation} className="w-12 h-12 bg-slate-800 text-slate-400 hover:text-white rounded-xl flex items-center justify-center"><RotateCcw size={20}/></button>
+         
          <div className="w-px h-10 bg-white/10" />
+         
          <div className="flex flex-col w-48 gap-1">
             <div className="flex justify-between text-[10px] font-bold text-slate-500 uppercase">
                 <span>Speed</span>
                 <span className={simSpeed < 1 ? 'text-neon-green' : ''}>{simSpeed < 1 ? 'TURBO' : `${simSpeed.toFixed(1)}ms`}</span>
             </div>
             <input type="range" min="0.1" max="200" step="0.1" value={200.1 - simSpeed} onChange={(e) => setSimSpeed(200.1 - Number(e.target.value))} className="w-full accent-blue-500 h-1.5 bg-slate-700 rounded appearance-none"/>
+         </div>
+
+         <div className="w-px h-10 bg-white/10" />
+
+         <div className="flex flex-col w-48 gap-1">
+             <div className="flex justify-between text-[10px] font-bold text-slate-500 uppercase">
+                <span>Learning Rate</span>
+                <span>{learningRate.toFixed(2)}</span>
+            </div>
+             <input 
+                type="range" min="0.01" max="1.0" step="0.01"
+                value={learningRate}
+                onChange={(e) => setLearningRate(Number(e.target.value))}
+                className="w-full accent-purple-500 h-1.5 bg-slate-700 rounded appearance-none"
+            />
          </div>
       </div>
       
@@ -602,10 +840,7 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
          <svg 
             ref={svgRef}
             className="w-full h-full cursor-move"
-            onMouseDown={handleMouseDown} 
-            onMouseMove={handleMouseMove} 
-            onMouseUp={handleMouseUp} 
-            onMouseLeave={handleMouseUp} 
+            onMouseDown={handleMouseDownCanvas} 
             onWheel={handleWheel}
             onContextMenu={(e) => e.preventDefault()}
          >
@@ -641,9 +876,23 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
                      const isActive = isActiveLayer(lIdx);
                      const baseR = isActive ? viewSettings.nodeSize * 1.3 : viewSettings.nodeSize;
                      const r = baseR * pos.scale;
+                     const fontSize = Math.max(10, viewSettings.textSize) * pos.scale;
 
                      const fillOpacity = isInput ? 1 : 0.2 + (value * 0.8);
                      
+                     const sSize = viewSettings.sliderSize;
+
+                     // Layout calculations
+                     const textY = pos.y + r + (fontSize * 0.5);
+                     const biasTextY = textY + fontSize;
+                     const biasSliderY = biasTextY + (fontSize * 0.5) + (5 * pos.scale);
+                     
+                     // Top Slider (Inputs/Targets)
+                     const topFOHeight = 60 * pos.scale * sSize; // Increased height to fix clipping
+                     const topFOWidth = 100 * pos.scale * sSize;
+                     const topFOY = pos.y - r - topFOHeight - (5 * pos.scale); // Position above node with buffer
+                     const topFOX = pos.x - (topFOWidth / 2);
+
                      return (
                          <g key={key}>
                              <circle cx={pos.x} cy={pos.y} r={r} 
@@ -653,16 +902,49 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
                                 strokeWidth={2 * pos.scale}
                                 filter={isActive ? `url(#glow-${direction==='FORWARD'?'green':'red'})` : ''}
                              />
+                             
+                             {/* Node Value (Activation) - Bottom of Node */}
                              {pos.scale > 0.4 && viewSettings.textSize > 0 && (
-                                 <text x={pos.x} y={pos.y + (r * 1.5) + 5} textAnchor="middle" fill="white" fontSize={viewSettings.textSize * pos.scale} className="font-mono font-bold pointer-events-none">
+                                 <text 
+                                    x={pos.x} 
+                                    y={textY} 
+                                    textAnchor="middle" 
+                                    fill="white" 
+                                    fontSize={fontSize} 
+                                    className="font-mono font-bold pointer-events-none"
+                                    style={{ textShadow: '0px 1px 4px rgba(0,0,0,0.8)' }}
+                                 >
                                      {value.toFixed(2)}
                                  </text>
                              )}
                              
-                             {/* Interactive Inputs/Targets */}
-                             {(isInput || isOutput) && (
-                                 <foreignObject x={pos.x - 40} y={pos.y - 25} width={80} height={50} style={{transform: `scale(${pos.scale})`, transformOrigin: `${pos.x}px ${pos.y}px`}}>
-                                     <div className="flex flex-col items-center" onMouseDown={(e) => e.stopPropagation()}>
+                             {/* Bias Value Text - Below Activation */}
+                             {!isInput && !isOutput && pos.scale > 0.4 && viewSettings.textSize > 0 && (
+                                 <text 
+                                    x={pos.x} 
+                                    y={biasTextY} 
+                                    textAnchor="middle" 
+                                    fill="#d8b4fe"
+                                    fontSize={fontSize * 0.8} 
+                                    className="font-mono pointer-events-none"
+                                    style={{ textShadow: '0px 1px 4px rgba(0,0,0,0.8)' }}
+                                 >
+                                     b:{bias.toFixed(2)}
+                                 </text>
+                             )}
+
+                             {/* Interactive Inputs/Targets - ABOVE Node */}
+                             {(isInput || isOutput) && sSize > 0 && (
+                                 <foreignObject 
+                                     x={topFOX} 
+                                     y={topFOY} 
+                                     width={topFOWidth} 
+                                     height={topFOHeight} 
+                                     style={{
+                                         // Ensure smooth transforms
+                                     }}
+                                 >
+                                     <div className="flex flex-col items-center justify-center rounded h-full" onMouseDown={(e) => e.stopPropagation()}>
                                          <input 
                                             type="range" min="0" max="1" step="0.1" 
                                             value={isInput ? (inputs[flatIdx]||0) : (target[flatIdx]||0)}
@@ -671,20 +953,30 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
                                                 if (isInput) { const n=[...inputs]; n[flatIdx]=val; setInputs(n); }
                                                 else { const n=[...target]; n[flatIdx]=val; setTarget(n); }
                                             }}
-                                            className={`w-16 h-1 rounded appearance-none ${isInput ? 'bg-blue-600 accent-blue-400' : 'bg-amber-600 accent-amber-400'}`}
+                                            className={`rounded appearance-none ${isInput ? 'bg-blue-600 accent-blue-400' : 'bg-amber-600 accent-amber-400'}`}
+                                            style={{
+                                                width: '80%',
+                                                height: '15%'
+                                            }}
                                          />
                                      </div>
                                  </foreignObject>
                              )}
 
-                             {/* Bias Slider (Hidden Layers) */}
-                             {!isInput && !isOutput && pos.scale > 0.5 && (
-                                  <foreignObject x={pos.x - 30} y={pos.y + 35*pos.scale} width={60} height={30} style={{transform: `scale(${pos.scale})`, transformOrigin: `${pos.x}px ${pos.y}px`}}>
-                                      <div className="flex justify-center" onMouseDown={(e) => e.stopPropagation()}>
+                             {/* Bias Slider - BELOW Text */}
+                             {!isInput && !isOutput && pos.scale > 0.5 && sSize > 0 && (
+                                  <foreignObject 
+                                    x={pos.x - (30 * pos.scale * sSize)} 
+                                    y={biasSliderY} 
+                                    width={60 * pos.scale * sSize} 
+                                    height={30 * pos.scale * sSize} 
+                                  >
+                                      <div className="flex justify-center items-center h-full" onMouseDown={(e) => e.stopPropagation()}>
                                           <input 
                                             type="range" min="-1" max="1" step="0.1" value={bias || 0}
                                             onChange={(e) => networkRef.current?.setLayerBias(lIdx, Number(e.target.value))}
-                                            className="w-10 h-1 bg-purple-900 accent-purple-500 rounded appearance-none opacity-50 hover:opacity-100"
+                                            className="w-full h-1 bg-purple-900 accent-purple-500 rounded appearance-none opacity-80 hover:opacity-100 cursor-pointer"
+                                            style={{ height: '20%' }}
                                           />
                                       </div>
                                   </foreignObject>
@@ -709,6 +1001,32 @@ export const NetworkGame: React.FC<NetworkGameProps> = ({ onUpdateContext }) => 
                              </div>
                          </foreignObject>
                      );
+                 } else if (item.type === 'ACTIVATION_CONTROL') {
+                    const { key, pos, lIdx } = item;
+                    const actKey = layerActivations[lIdx];
+                    const actDef = ACTIVATION_FUNCTIONS[actKey];
+                    
+                    // Calculate average pre-activation for visual dot
+                    const layerStartIdx = displayStats.values.slice(0, lIdx).reduce((acc, val) => acc + val.length, 0);
+                    const layerPreActs = displayStats.preActivations[lIdx] || [];
+                    const avgPreAct = layerPreActs.length > 0 
+                        ? layerPreActs.reduce((a, b) => a + b, 0) / layerPreActs.length
+                        : 0;
+
+                    const visual = getActivationVisual(actKey, avgPreAct, 40, 20);
+
+                    return (
+                        <g key={key} transform={`translate(${pos.x}, ${pos.y}) scale(${pos.scale})`} className="cursor-pointer hover:opacity-80" onClick={() => cycleActivation(lIdx)} onMouseDown={(e) => e.stopPropagation()}>
+                            <rect x="-30" y="-20" width="60" height="40" rx="8" fill="#1e293b" stroke={actDef.color} strokeWidth="1.5" fillOpacity="0.9" />
+                            <text x="0" y="-8" textAnchor="middle" fill={actDef.color} fontSize="8" fontWeight="bold" fontFamily="monospace">{actDef.name}</text>
+                            
+                            {/* Mini Graph */}
+                            <g transform="translate(-20, 0)">
+                                <path d={visual.pathD} fill="none" stroke={actDef.color} strokeWidth="1.5" />
+                                <circle cx={visual.dotX} cy={visual.dotY} r="2" fill="white" className="animate-pulse" />
+                            </g>
+                        </g>
+                    );
                  }
                  return null;
              })}
